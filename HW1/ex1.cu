@@ -123,7 +123,7 @@ __global__ void process_image_kernel(uchar *all_in, uchar *all_out, uchar *maps)
         }
     }
 
-    interpolate_device(maps, all_in + offset_in_img, all_out + offset_in_img);
+    interpolate_device(maps + offset_in_maps, all_in + offset_in_img, all_out + offset_in_img);
     __syncthreads();
 
     return; 
@@ -155,16 +155,16 @@ struct task_serial_context *task_serial_init()
  * provided output host array */
 void task_serial_process(struct task_serial_context *context, uchar *images_in, uchar *images_out)
 {
-    uchar* current_image_in = images_in;
-    uchar* current_image_out = images_out;
+    uchar* current_image_in;
+    uchar* current_image_out;
 
     for(int i = 0; i < N_IMAGES; i++){
         current_image_in = images_in + IMG_HEIGHT * IMG_WIDTH * i;
         current_image_out = images_out + IMG_HEIGHT * IMG_WIDTH * i;
 
-        cudaMemcpy(context->image_in, current_image_out, sizeof(*current_image_in) * IMG_HEIGHT * IMG_WIDTH, cudaMemcpyHostToDevice);
-        process_image_kernel<<<1, THREADS_PER_BLOCK>>>(context->image_in, current_image_out, context->tiles_maps);
-        cudaMemcpy(current_image_out, context->image_in, sizeof(*current_image_out) * IMG_HEIGHT * IMG_WIDTH, cudaMemcpyDeviceToHost);
+        cudaMemcpy(context->image_in, current_image_in, sizeof(uchar) * IMG_HEIGHT * IMG_WIDTH, cudaMemcpyHostToDevice);
+        process_image_kernel<<<1, THREADS_PER_BLOCK>>>(context->image_in, context->image_out, context->tiles_maps);
+        cudaMemcpy(current_image_out, context->image_out, sizeof(uchar) * IMG_HEIGHT * IMG_WIDTH, cudaMemcpyDeviceToHost);
     }
 
 }

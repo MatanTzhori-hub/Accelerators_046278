@@ -1,15 +1,15 @@
 #include "ex1.h"
 
-#define COLOR_VALUES = 256;
-#define THREADS_PER_BLOCK = 512;
+#define COLOR_VALUES 256
+#define THREADS_PER_BLOCK 512
 
 __device__
 void prefix_sum(int arr[], int arr_size) {
-    int tid = threadId.x;
+    int tid = threadIdx.x;
     int increment;
     for(int stride = 1; stride < blockDim.x; stride *= 2){
         if(tid >= stride){
-            increment = arr[tid - stride]
+            increment = arr[tid - stride];
         }
         __syncthreads();
         if(tid >= stride){
@@ -49,7 +49,7 @@ void calc_tile_histogram(int* histogram, uchar* image_in, int tile_row_rum, int 
 
 /**
  * Calculates the map for the current tile of the histogram equalization
- * @param maps 3D array of size [TILES_COUNT][TILES_COUNT][COLOR_VALUES] that maps each tiles 
+ * @param maps 3D array of size [TILE_COUNT][TILE_COUNT][COLOR_VALUES] that maps each tiles 
  *             gray values from before the equalization to after it.
  * @param tile_row_rum the index of the current tile's row in the image.
  * @param tile_col_num the index of the current tile's column in the image.
@@ -59,14 +59,14 @@ __device__
 void calc_tile_map(uchar* maps, int tile_row_rum, int tile_col_num, int* CDF_func)
 {
     const int tid = threadIdx.x;
-    const int numThreads = blockDim.x
+    const int numThreads = blockDim.x;
     int work_per_thread = COLOR_VALUES / numThreads;
     if (COLOR_VALUES % numThreads != 0)
-        work_per_thread++
+        work_per_thread++;
     
     for(int i = 0; i < work_per_thread; i++)
-        if(tid + i * numThreads < length)
-            maps[tile_row_rum][tile_col_num][tid + i * numThreads] = float(CDF_func[tid + i * numThreads]) * (COLOR_VALUES - 1) / (TILE_COUNT * TILE_COUNT);
+        if(tid + i * numThreads < COLOR_VALUES)
+            maps[tile_row_rum * TILE_COUNT + tile_col_num + tid + i * numThreads] = float(CDF_func[tid + i * numThreads]) * (COLOR_VALUES - 1) / (TILE_COUNT * TILE_COUNT);
 }
 
 /**
@@ -79,10 +79,10 @@ __device__
 void array_initiate(int* arr, int length, int value)
 {
     const int tid = threadIdx.x;
-    const int numThreads = blockDim.x
+    const int numThreads = blockDim.x;
     int work_per_thread = COLOR_VALUES / numThreads;
     if (COLOR_VALUES % numThreads != 0)
-        work_per_thread++
+        work_per_thread++;
     
     for(int i = 0; i < work_per_thread; i++)
         if(tid + i * numThreads < length)
@@ -104,7 +104,7 @@ __global__ void process_image_kernel(uchar *all_in, uchar *all_out, uchar *maps)
     
     __shared__ int histogram[sizeof(int) * COLOR_VALUES];
     const int offset_in_img = IMG_HEIGHT * IMG_WIDTH * blockIdx.x;
-    const int offset_in_maps = COLOR_COUNT * TILE_COUNT * TILE_COUNT * blockIdx.x;
+    const int offset_in_maps = COLOR_VALUES * TILE_COUNT * TILE_COUNT * blockIdx.x;
 
     for(int tile_row = 0; tile_row < TILE_COUNT; tile_row++)
     {
@@ -144,9 +144,9 @@ struct task_serial_context *task_serial_init()
     auto context = new task_serial_context;
 
     //Allocate GPU memory for a single input image, a single output image, and maps
-    CUDA_CHECK(cudaMalloc(context->image_in, sizeof(char) * IMG_HEIGHT * IMG_WIDTH));
-    CUDA_CHECK(cudaMalloc(context->image_out, sizeof(char) * IMG_HEIGHT * IMG_WIDTH));
-    CUDA_CHECK(cudaMalloc(context->tiles_maps, sizeof(char) * TILE_COUNT * TILE_COUNT * COLOR_VALUES);
+    CUDA_CHECK(cudaMalloc((void**)&context->image_in, sizeof(char) * IMG_HEIGHT * IMG_WIDTH));
+    CUDA_CHECK(cudaMalloc((void**)&context->image_out, sizeof(char) * IMG_HEIGHT * IMG_WIDTH));
+    CUDA_CHECK(cudaMalloc((void**)&context->tiles_maps, sizeof(char) * TILE_COUNT * TILE_COUNT * COLOR_VALUES));
 
     return context;
 }
@@ -156,21 +156,17 @@ struct task_serial_context *task_serial_init()
 void task_serial_process(struct task_serial_context *context, uchar *images_in, uchar *images_out)
 {
     uchar* current_image_in = images_in;
-    uchar* current_images_out = images_out;
+    uchar* current_image_out = images_out;
 
     for(int i = 0; i < N_IMAGES; i++){
-        current_image_in = images_in + IMG_HEIGHT * IMG_WIDTH * i
-        current_images_out = images_out + IMG_HEIGHT * IMG_WIDTH * i
+        current_image_in = images_in + IMG_HEIGHT * IMG_WIDTH * i;
+        current_image_out = images_out + IMG_HEIGHT * IMG_WIDTH * i;
 
         cudaMemcpy(context->image_in, current_image_out, sizeof(*current_image_in) * IMG_HEIGHT * IMG_WIDTH, cudaMemcpyHostToDevice);
         process_image_kernel<<<1, THREADS_PER_BLOCK>>>(context->image_in, current_image_out, context->tiles_maps);
         cudaMemcpy(current_image_out, context->image_in, sizeof(*current_image_out) * IMG_HEIGHT * IMG_WIDTH, cudaMemcpyDeviceToHost);
     }
 
-    //TODO: in a for loop:
-    //   1. copy the relevant image from images_in to the GPU memory you allocated
-    //   2. invoke GPU kernel on this image
-    //   3. copy output from GPU memory to relevant location in images_out_gpu_serial
 }
 
 /* Release allocated resources for the task-serial implementation. */
@@ -180,7 +176,7 @@ void task_serial_free(struct task_serial_context *context)
     cudaFree(context->image_out);
     cudaFree(context->tiles_maps);
 
-    free(context);
+    delete(context);
 }
 
 /* Bulk GPU context struct with necessary CPU / GPU pointers to process all the images */
@@ -214,5 +210,5 @@ void gpu_bulk_free(struct gpu_bulk_context *context)
 {
     //TODO: free resources allocated in gpu_bulk_init
 
-    free(context);
+    delete(context);
 }

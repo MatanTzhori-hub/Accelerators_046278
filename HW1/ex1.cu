@@ -58,6 +58,7 @@ void calc_tile_histogram(int* histogram, uchar* image_in, int tile_row_rum, int 
 __device__
 void calc_tile_map(uchar* maps, int tile_row_rum, int tile_col_num, int* CDF_func)
 {
+    int index_in_map;
     const int tid = threadIdx.x;
     const int numThreads = blockDim.x;
     int work_per_thread = COLOR_VALUES / numThreads;
@@ -65,8 +66,10 @@ void calc_tile_map(uchar* maps, int tile_row_rum, int tile_col_num, int* CDF_fun
         work_per_thread++;
     
     for(int i = 0; i < work_per_thread; i++)
-        if(tid + i * numThreads < COLOR_VALUES)
-            maps[tile_row_rum * TILE_COUNT + tile_col_num + tid + i * numThreads] = float(CDF_func[tid + i * numThreads]) * (COLOR_VALUES - 1) / (TILE_COUNT * TILE_COUNT);
+        if(tid + i * numThreads < COLOR_VALUES){
+            index_in_map = tile_row_rum * TILE_COUNT * COLOR_VALUES + tile_col_num * COLOR_VALUES + tid + i * numThreads
+            maps[index_in_map] = float(CDF_func[tid + i * numThreads]) * (COLOR_VALUES - 1) / (TILE_COUNT * TILE_COUNT);
+        }
 }
 
 /**

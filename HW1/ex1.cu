@@ -60,6 +60,10 @@ void calc_tile_map(uchar* maps, int tile_row_rum, int tile_col_num, int* CDF_fun
 {
     int index_in_map;
     const int tid = threadIdx.x;
+
+    if (tid >= COLOR_VALUES)
+        return;
+    
     const int numThreads = blockDim.x;
     int work_per_thread = COLOR_VALUES / numThreads;
     if (COLOR_VALUES % numThreads != 0)
@@ -68,7 +72,7 @@ void calc_tile_map(uchar* maps, int tile_row_rum, int tile_col_num, int* CDF_fun
     for(int i = 0; i < work_per_thread; i++)
         if(tid + i * numThreads < COLOR_VALUES){
             index_in_map = tile_row_rum * TILE_COUNT * COLOR_VALUES + tile_col_num * COLOR_VALUES + tid + i * numThreads;
-            maps[index_in_map] = float(CDF_func[tid + i * numThreads]) * (COLOR_VALUES - 1) / (TILE_COUNT * TILE_COUNT);
+            maps[index_in_map] = float(CDF_func[tid + i * numThreads]) * (COLOR_VALUES - 1) / (TILE_WIDTH * TILE_WIDTH);
         }
 }
 

@@ -134,8 +134,8 @@ __global__ void process_image_kernel(uchar *all_in, uchar *all_out, uchar *maps)
 
 /* Task serial context struct with necessary CPU / GPU pointers to process a single image */
 struct task_serial_context {
-    uchar* image_in; // size of [IMG_HEIGHT][IMG_WIDTH]
-    uchar* image_out; // size of [IMG_HEIGHT][IMG_WIDTH]
+    uchar* image_in;   // size of [IMG_HEIGHT][IMG_WIDTH]
+    uchar* image_out;  // size of [IMG_HEIGHT][IMG_WIDTH]
     uchar* tiles_maps; // size of [TILE_COUNT][TILE_COUNT][COLOR_VALUES]
 };
 
@@ -184,7 +184,9 @@ void task_serial_free(struct task_serial_context *context)
 
 /* Bulk GPU context struct with necessary CPU / GPU pointers to process all the images */
 struct gpu_bulk_context {
-    // TODO define bulk-GPU memory buffers
+    uchar* images_in;  // size of [N_IMAGES][IMG_HEIGHT][IMG_WIDTH]
+    uchar* images_out; // size of [N_IMAGES][IMG_HEIGHT][IMG_WIDTH]
+    uchar* tiles_maps; // size of [N_IMAGES][TILE_COUNT][TILE_COUNT][COLOR_VALUES]
 };
 
 /* Allocate GPU memory for all the input images, output images, and maps.
@@ -194,7 +196,10 @@ struct gpu_bulk_context *gpu_bulk_init()
 {
     auto context = new gpu_bulk_context;
 
-    //TODO: allocate GPU memory for all the input images, output images, and maps
+    //Allocate GPU memory for a all input images, all output images, and all maps
+    CUDA_CHECK(cudaMalloc((void**)&context->images_in, sizeof(char) * N_IMAGES * IMG_HEIGHT * IMG_WIDTH));
+    CUDA_CHECK(cudaMalloc((void**)&context->images_out, sizeof(char) * N_IMAGES * IMG_HEIGHT * IMG_WIDTH));
+    CUDA_CHECK(cudaMalloc((void**)&context->tiles_maps, sizeof(char) * N_IMAGES * TILE_COUNT * TILE_COUNT * COLOR_VALUES));
 
     return context;
 }
@@ -203,15 +208,17 @@ struct gpu_bulk_context *gpu_bulk_init()
  * provided output host array */
 void gpu_bulk_process(struct gpu_bulk_context *context, uchar *images_in, uchar *images_out)
 {
-    //TODO: copy all input images from images_in to the GPU memory you allocated
-    //TODO: invoke a kernel with N_IMAGES threadblocks, each working on a different image
-    //TODO: copy output images from GPU memory to images_out
+    cudaMemcpy(context->images_in, images_in, sizeof(uchar) * N_IMAGES * IMG_HEIGHT * IMG_WIDTH, cudaMemcpyHostToDevice);
+    process_image_kernel<<<N_IMAGES, THREADS_PER_BLOCK>>>(context->images_in, context->images_out, context->tiles_maps);
+    cudaMemcpy(images_out, context->images_out, sizeof(uchar) * N_IMAGES * IMG_HEIGHT * IMG_WIDTH, cudaMemcpyDeviceToHost);
 }
 
 /* Release allocated resources for the bulk GPU implementation. */
 void gpu_bulk_free(struct gpu_bulk_context *context)
 {
-    //TODO: free resources allocated in gpu_bulk_init
+    cudaFree(context->images_in);
+    cudaFree(context->images_out);
+    cudaFree(context->tiles_maps);
 
     delete(context);
 }

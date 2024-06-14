@@ -7,7 +7,7 @@ CFLAGS=-O3 -lineinfo
 endif
 
 CFLAGS+=-Xcompiler=-Wall -maxrregcount=64 -arch=sm_75
-CFLAGS+=`pkg-config opencv --cflags --libs`
+CFLAGS+=`pkg-config opencv4 --cflags --libs`
 
 FILES=ex1 image
 

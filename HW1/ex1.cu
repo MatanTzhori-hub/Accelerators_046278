@@ -1,18 +1,20 @@
 #include "ex1.h"
 
 #define COLOR_VALUES 256
-#define THREADS_PER_BLOCK 512
+#define THREADS_PER_BLOCK 1024
 
+// Requires atleast <size of arr> threads
 __device__
 void prefix_sum(int arr[], int arr_size) {
     int tid = threadIdx.x;
     int increment;
-    for(int stride = 1; stride < blockDim.x; stride *= 2){
-        if(tid >= stride){
+
+    for(int stride = 1; stride < arr_size; stride *= 2){
+        if(tid >= stride & tid < arr_size){
             increment = arr[tid - stride];
         }
         __syncthreads();
-        if(tid >= stride){
+        if(tid >= stride & tid < arr_size){
             arr[tid] += increment;
         }
         __syncthreads();
@@ -24,25 +26,25 @@ void prefix_sum(int arr[], int arr_size) {
  * Calculates the histogram of a single tile of an image
  * @param histogram int array of size [COLOR_VALUES].
  * @param image_in 2D char array of the input image.
- * @param tile_row_rum the index of the current tile's row in the image.
+ * @param tile_row_num the index of the current tile's row in the image.
  * @param tile_col_num the index of the current tile's column in the image.
  */
 __device__
-void calc_tile_histogram(int* histogram, uchar* image_in, int tile_row_rum, int tile_col_num)
+void calc_tile_histogram(int* histogram, uchar* image_in, int tile_row_num, int tile_col_num)
 {
     int pixel_value = 0;
     int index_in_img = 0;
 
     const int tid = threadIdx.x;
     const int rows_group_size = blockDim.x / TILE_WIDTH;
-    const int row_index = tile_row_rum * TILE_WIDTH + tid / TILE_WIDTH;
+    const int row_index = tile_row_num * TILE_WIDTH + tid / TILE_WIDTH;
     const int col_index = tile_col_num * TILE_WIDTH + tid % TILE_WIDTH;
     
     for(int i = 0 ; i < TILE_WIDTH ; i+=rows_group_size)
     {
         index_in_img = (row_index + i) * IMG_WIDTH + col_index;
         pixel_value = image_in[index_in_img];
-        if (row_index + i < (tile_row_rum + 1) * TILE_WIDTH)
+        if (row_index + i < (tile_row_num + 1) * TILE_WIDTH)
             atomicAdd(&histogram[pixel_value], 1);
     }  
 }
@@ -51,18 +53,15 @@ void calc_tile_histogram(int* histogram, uchar* image_in, int tile_row_rum, int 
  * Calculates the map for the current tile of the histogram equalization
  * @param maps 3D array of size [TILE_COUNT][TILE_COUNT][COLOR_VALUES] that maps each tiles 
  *             gray values from before the equalization to after it.
- * @param tile_row_rum the index of the current tile's row in the image.
+ * @param tile_row_num the index of the current tile's row in the image.
  * @param tile_col_num the index of the current tile's column in the image.
  * @param CDF_func int array of the CDF function of the tile's histogram.
  */
 __device__
-void calc_tile_map(uchar* maps, int tile_row_rum, int tile_col_num, int* CDF_func)
+void calc_tile_map(uchar* maps, int tile_row_num, int tile_col_num, int* CDF_func)
 {
-    int index_in_map;
     const int tid = threadIdx.x;
-
-    if (tid >= COLOR_VALUES)
-        return;
+    int start_index_in_map = tile_row_num * TILE_COUNT * COLOR_VALUES + tile_col_num * COLOR_VALUES;
     
     const int numThreads = blockDim.x;
     int work_per_thread = COLOR_VALUES / numThreads;
@@ -71,8 +70,7 @@ void calc_tile_map(uchar* maps, int tile_row_rum, int tile_col_num, int* CDF_fun
     
     for(int i = 0; i < work_per_thread; i++)
         if(tid + i * numThreads < COLOR_VALUES){
-            index_in_map = tile_row_rum * TILE_COUNT * COLOR_VALUES + tile_col_num * COLOR_VALUES + tid + i * numThreads;
-            maps[index_in_map] = float(CDF_func[tid + i * numThreads]) * (COLOR_VALUES - 1) / (TILE_WIDTH * TILE_WIDTH);
+            maps[start_index_in_map + tid + i * numThreads] = float(CDF_func[tid + i * numThreads]) * (COLOR_VALUES - 1) / (TILE_WIDTH * TILE_WIDTH);
         }
 }
 
@@ -86,6 +84,7 @@ __device__
 void array_initiate(int* arr, int length, int value)
 {
     const int tid = threadIdx.x;
+    
     const int numThreads = blockDim.x;
     int work_per_thread = COLOR_VALUES / numThreads;
     if (COLOR_VALUES % numThreads != 0)
@@ -169,9 +168,9 @@ void task_serial_process(struct task_serial_context *context, uchar *images_in, 
         current_image_in = images_in + IMG_HEIGHT * IMG_WIDTH * i;
         current_image_out = images_out + IMG_HEIGHT * IMG_WIDTH * i;
 
-        cudaMemcpy(context->image_in, current_image_in, sizeof(uchar) * IMG_HEIGHT * IMG_WIDTH, cudaMemcpyHostToDevice);
+        CUDA_CHECK(cudaMemcpy(context->image_in, current_image_in, sizeof(uchar) * IMG_HEIGHT * IMG_WIDTH, cudaMemcpyHostToDevice));
         process_image_kernel<<<1, THREADS_PER_BLOCK>>>(context->image_in, context->image_out, context->tiles_maps);
-        cudaMemcpy(current_image_out, context->image_out, sizeof(uchar) * IMG_HEIGHT * IMG_WIDTH, cudaMemcpyDeviceToHost);
+        CUDA_CHECK(cudaMemcpy(current_image_out, context->image_out, sizeof(uchar) * IMG_HEIGHT * IMG_WIDTH, cudaMemcpyDeviceToHost));
     }
 
 }
@@ -179,9 +178,9 @@ void task_serial_process(struct task_serial_context *context, uchar *images_in, 
 /* Release allocated resources for the task-serial implementation. */
 void task_serial_free(struct task_serial_context *context)
 {
-    cudaFree(context->image_in);
-    cudaFree(context->image_out);
-    cudaFree(context->tiles_maps);
+    CUDA_CHECK(cudaFree(context->image_in));
+    CUDA_CHECK(cudaFree(context->image_out));
+    CUDA_CHECK(cudaFree(context->tiles_maps));
 
     delete(context);
 }
@@ -212,17 +211,17 @@ struct gpu_bulk_context *gpu_bulk_init()
  * provided output host array */
 void gpu_bulk_process(struct gpu_bulk_context *context, uchar *images_in, uchar *images_out)
 {
-    cudaMemcpy(context->images_in, images_in, sizeof(uchar) * N_IMAGES * IMG_HEIGHT * IMG_WIDTH, cudaMemcpyHostToDevice);
+    CUDA_CHECK(cudaMemcpy(context->images_in, images_in, sizeof(uchar) * N_IMAGES * IMG_HEIGHT * IMG_WIDTH, cudaMemcpyHostToDevice));
     process_image_kernel<<<N_IMAGES, THREADS_PER_BLOCK>>>(context->images_in, context->images_out, context->tiles_maps);
-    cudaMemcpy(images_out, context->images_out, sizeof(uchar) * N_IMAGES * IMG_HEIGHT * IMG_WIDTH, cudaMemcpyDeviceToHost);
+    CUDA_CHECK(cudaMemcpy(images_out, context->images_out, sizeof(uchar) * N_IMAGES * IMG_HEIGHT * IMG_WIDTH, cudaMemcpyDeviceToHost));
 }
 
 /* Release allocated resources for the bulk GPU implementation. */
 void gpu_bulk_free(struct gpu_bulk_context *context)
 {
-    cudaFree(context->images_in);
-    cudaFree(context->images_out);
-    cudaFree(context->tiles_maps);
+    CUDA_CHECK(cudaFree(context->images_in));
+    CUDA_CHECK(cudaFree(context->images_out));
+    CUDA_CHECK(cudaFree(context->tiles_maps));
 
     delete(context);
 }

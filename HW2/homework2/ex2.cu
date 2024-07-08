@@ -3,7 +3,11 @@
 
 #define COLOR_VALUES 256
 #define THREADS_PER_BLOCK 1024
+#define REGISTERS_PER_THREAD 32
 #define EMPTY_STREAM -1
+#define EMPTY_QUEUE -1
+#define SHARED_MEM_USAGE 2048 // TODO: remove this after calculating the right shared mem usage
+
 
 // Requires atleast <size of arr> threads
 __device__ void prefix_sum(int arr[], int arr_size) {
@@ -110,7 +114,7 @@ __device__
 __device__
 void process_image(uchar *in, uchar *out, uchar* maps) {
     // TODO complete according to hw1
-    __shared__ int histogram[sizeof(int) * COLOR_VALUES];
+    __shared__ int histogram[COLOR_VALUES];
 
     for(int tile_row = 0; tile_row < TILE_COUNT; tile_row++)
     {
@@ -139,6 +143,8 @@ __global__
 void process_image_kernel(uchar *in, uchar *out, uchar* maps){
     process_image(in, out, maps);
 }
+
+/************************************************** STREAMS PART **************************************************/
 
 class streams_server : public image_processing_server
 {
@@ -220,40 +226,250 @@ std::unique_ptr<image_processing_server> create_streams_server()
     return std::make_unique<streams_server>();
 }
 
+
+/************************************************** QUEUES PART **************************************************/
+
 // TODO implement a lock
+class GPU_Lock{
+    private:
+        cuda::atomic<int, cuda::thread_scope_device> _lock;
+
+    public:
+        __device__
+        GPU_Lock() : _lock(0){ ; }
+
+        ~GPU_Lock() = default;
+
+        __device__
+        void lock() {
+            while (_lock.exchange(1, cuda::memory_order_relaxed)) { ; }
+            cuda::atomic_thread_fence(cuda::memory_order_acquire, cuda::thread_scope_device);
+        }
+
+        __device__
+        void unlock(){
+            _lock.store(0, cuda::memory_order_release);
+        }
+};
+
+__device__ GPU_Lock* gpu_cpu_lock;
+__device__ GPU_Lock* cpu_gpu_lock;
+
 // TODO implement a MPMC queue
+struct RequestItem
+{
+    int image_id;
+    uchar* image_in;
+    uchar* image_out;
+};
+
+
+template <typename T> class RingBuffer {
+    private:
+        T* _mailbox;
+        size_t N;
+        cuda::atomic<size_t> _head = 0, _tail = 0;
+
+    public:
+        bool terminate;
+
+        explicit RingBuffer(size_t size) : N(size), _head(0), _tail(0), terminate(false){
+            CUDA_CHECK(cudaMallocHost(&_mailbox, sizeof(T) * size));
+        }
+
+        ~RingBuffer(){
+            CUDA_CHECK(cudaFreeHost(_mailbox));
+        }
+
+        __device__ __host__
+        bool push(const T &data) {
+            size_t tail = _tail.load(cuda::memory_order_relaxed);
+            if(tail - _head.load(cuda::memory_order_acquire) == N) {
+                return false;
+            }
+
+            _mailbox[tail % N] = data;
+            _tail.store(tail + 1, cuda::memory_order_release);
+
+            return true;
+        }
+
+        __device__ __host__
+        T pop() {
+            T item = RequestItem();
+            size_t head = _head.load(cuda::memory_order_relaxed);
+            if(_tail.load(cuda::memory_order_acquire) == head){
+                item.image_id = EMPTY_QUEUE;
+            }
+            else{
+                item = _mailbox[head % N];
+            }
+
+            _head.store(head + 1, cuda::memory_order_release);
+            return item;
+        }
+};
+
+
 // TODO implement the persistent kernel
+__global__
+void persistent_kernel_image_process(RingBuffer<RequestItem>* cpu_gpu_q, RingBuffer<RequestItem>* gpu_cpu_q, uchar* maps){
+    __shared__ RequestItem request;
+    
+    uint32_t tid = threadIdx.x;
+    uint32_t bid = blockIdx.x;
+
+    uchar* cur_tb_maps = maps + bid * TILE_COUNT * TILE_COUNT * COLOR_VALUES;
+
+    while(true){
+        if(cpu_gpu_q->terminate || gpu_cpu_q->terminate){
+            return;
+        }
+
+        if(tid == 0){
+            cpu_gpu_lock->lock();
+            request = cpu_gpu_q->pop();
+            cpu_gpu_lock->unlock();
+        }
+        __syncthreads();
+
+        if(request.image_id != EMPTY_QUEUE){
+            __syncthreads();
+            process_image(request.image_in, request.image_out, cur_tb_maps);
+            __syncthreads();
+
+            if(tid == 0){
+                gpu_cpu_lock->lock();
+                while(!gpu_cpu_q->push(request)) {;}
+                gpu_cpu_lock->unlock();
+
+            }
+        }
+    }
+}
+
+
 // TODO implement a function for calculating the threadblocks count
+int calculate_threadblocks_amount(int threads_per_block){
+    cudaDeviceProp GPU_Properties;
+    CUDA_CHECK(cudaGetDeviceProperties(&GPU_Properties, 0));
+
+    // Device constrains
+    int share_mem_usage_per_tb = SHARED_MEM_USAGE;
+    int regs_per_thread = REGISTERS_PER_THREAD;
+
+    size_t shared_mem_per_SM = GPU_Properties.sharedMemPerMultiprocessor;
+    int max_threads_per_SM = GPU_Properties.maxThreadsPerMultiProcessor;
+    int regs_per_SM = GPU_Properties.regsPerMultiprocessor;
+
+    int sm_amount = GPU_Properties.multiProcessorCount;
+
+    // Calculated constrains
+    // For each SM we calculate the constrain according to amount of registers,
+    // amount of shared memory, and amount of threads.
+    int tb_regs_constrain = regs_per_SM / (threads_per_block * regs_per_thread);
+    int tb_smem_constrain = shared_mem_per_SM / share_mem_usage_per_tb;
+    int tb_threads_constrain = max_threads_per_SM / threads_per_block;
+
+    int max_tb_per_sm = min(1, min(tb_regs_constrain, min(tb_smem_constrain, tb_threads_constrain)));
+
+    // We return the amount of Threadblocks per SM times the amount of SM's for the total amount of TB.
+    return max_tb_per_sm * sm_amount;
+}
+
+int calculate_queue_size(int threadblocks_amount){
+    return (int)pow(2, ceil(log(16 * threadblocks_amount) / log(2)));
+}
+
+__global__ void init_gpu_locks(){
+    uint32_t tid = threadIdx.x;
+    uint32_t bid = blockIdx.x;
+    
+    if(tid == 0 && bid == 0){
+        gpu_cpu_lock = new GPU_Lock();
+        cpu_gpu_lock = new GPU_Lock();
+    }
+}
+
+__global__ void destroy_gpu_locks(){
+    uint32_t tid = threadIdx.x;
+    uint32_t bid = blockIdx.x;
+    
+    if(tid == 0 && bid == 0){
+        delete gpu_cpu_lock;
+        delete cpu_gpu_lock;
+        gpu_cpu_lock = nullptr;
+        cpu_gpu_lock = nullptr;
+    }
+}
 
 class queue_server : public image_processing_server
 {
 private:
     // TODO define queue server context (memory buffers, etc...)
+    RingBuffer<RequestItem>* cpu_gpu_q;
+    RingBuffer<RequestItem>* gpu_cpu_q;
+    uchar* maps;
+
 public:
     queue_server(int threads)
     {
         // TODO initialize host state
+        int tb_amount = calculate_threadblocks_amount(threads);
+        int q_size = calculate_queue_size(tb_amount);
+        
+        // Allocate queues and maps memory
+        CUDA_CHECK(cudaMallocHost(&cpu_gpu_q, sizeof(RingBuffer<RequestItem>)));
+        CUDA_CHECK(cudaMallocHost(&gpu_cpu_q, sizeof(RingBuffer<RequestItem>)));
+        CUDA_CHECK(cudaMalloc(&maps, tb_amount * TILE_COUNT * TILE_COUNT * COLOR_VALUES));
+
+        // Initialize the queues
+        new (cpu_gpu_q) RingBuffer<RequestItem>(q_size);
+        new (gpu_cpu_q) RingBuffer<RequestItem>(q_size);
         // TODO launch GPU persistent kernel with given number of threads, and calculated number of threadblocks
+
+        init_gpu_locks<<<1,1>>>();
+        CUDA_CHECK(cudaDeviceSynchronize());
+        persistent_kernel_image_process<<<tb_amount, threads>>>(cpu_gpu_q, gpu_cpu_q, maps);
     }
 
     ~queue_server() override
     {
         // TODO free resources allocated in constructor
+        cpu_gpu_q->terminate = true;
+        gpu_cpu_q->terminate = true;
+        CUDA_CHECK(cudaDeviceSynchronize());
+
+        cpu_gpu_q->~RingBuffer();
+        gpu_cpu_q->~RingBuffer();
+        CUDA_CHECK(cudaFreeHost(cpu_gpu_q));
+        CUDA_CHECK(cudaFreeHost(gpu_cpu_q));
+        CUDA_CHECK(cudaFree(maps));
+
+        destroy_gpu_locks<<<1,1>>>();
+        CUDA_CHECK(cudaDeviceSynchronize());
     }
 
     bool enqueue(int img_id, uchar *img_in, uchar *img_out) override
     {
         // TODO push new task into queue if possible
-        return false;
+        RequestItem item;
+        item.image_id = img_id;
+        item.image_in = img_in;
+        item.image_out = img_out;
+        return cpu_gpu_q->push(item);
     }
 
     bool dequeue(int *img_id) override
     {
         // TODO query (don't block) the producer-consumer queue for any responses.
-        return false;
+        RequestItem response = gpu_cpu_q->pop();
+        if(response.image_id == EMPTY_QUEUE){
+            return false;
+        }
 
         // TODO return the img_id of the request that was completed.
-        //*img_id = ... 
+        *img_id = response.image_id; 
         return true;
     }
 };

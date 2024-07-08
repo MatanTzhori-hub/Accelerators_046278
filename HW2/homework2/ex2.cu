@@ -282,17 +282,16 @@ struct RequestItem
     uchar* image_out;
 };
 
-template <typename T> class RingBuffer {
+template <typename T>
+class RingBuffer {
     private:
         T* _mailbox;
         size_t N;
         cuda::atomic<size_t> _head = 0, _tail = 0;
 
     public:
-        bool terminate;
-
         RingBuffer() = default;
-        explicit RingBuffer(size_t size) : _mailbox(nullptr), N(size), _head(0), _tail(0), terminate(false){
+        explicit RingBuffer(size_t size) : _mailbox(nullptr), N(size), _head(0), _tail(0){
             CUDA_CHECK(cudaMallocHost(&_mailbox, sizeof(T) * size));
         }
 
@@ -303,7 +302,7 @@ template <typename T> class RingBuffer {
         __device__ __host__
         bool push(const T &data) {
             size_t tail = _tail.load(cuda::memory_order_relaxed);
-            if(tail - _head.load(cuda::memory_order_acquire) % (2 * N) == N) {
+            if((tail - _head.load(cuda::memory_order_acquire)) % (2 * N) == N) {
                 return false;
             }
 

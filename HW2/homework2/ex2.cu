@@ -6,6 +6,7 @@
 #define REGISTERS_PER_THREAD 32
 #define EMPTY_STREAM -1
 #define EMPTY_QUEUE -1
+#define TERMINATE -2
 #define SHARED_MEM_USAGE 2048 // TODO: remove this after calculating the right shared mem usage
 
 
@@ -236,7 +237,7 @@ class GPU_Lock{
 
     public:
         __device__
-        GPU_Lock() : _lock(0){ ; }
+        GPU_Lock() : _lock(0){}
 
         ~GPU_Lock() = default;
 
@@ -252,8 +253,26 @@ class GPU_Lock{
         }
 };
 
-__device__ GPU_Lock* gpu_cpu_lock;
-__device__ GPU_Lock* cpu_gpu_lock;
+__device__ GPU_Lock* gpu_lock;
+
+__global__ void init_gpu_lock(){
+    uint32_t tid = threadIdx.x;
+    uint32_t bid = blockIdx.x;
+    
+    if(tid == 0 && bid == 0){
+        gpu_lock = new GPU_Lock();
+    }
+}
+
+__global__ void destroy_gpu_lock(){
+    uint32_t tid = threadIdx.x;
+    uint32_t bid = blockIdx.x;
+    
+    if(tid == 0 && bid == 0){
+        delete gpu_lock;
+        gpu_lock = nullptr;
+    }
+}
 
 // TODO implement a MPMC queue
 struct RequestItem
@@ -262,7 +281,6 @@ struct RequestItem
     uchar* image_in;
     uchar* image_out;
 };
-
 
 template <typename T> class RingBuffer {
     private:
@@ -273,7 +291,8 @@ template <typename T> class RingBuffer {
     public:
         bool terminate;
 
-        explicit RingBuffer(size_t size) : N(size), _head(0), _tail(0), terminate(false){
+        RingBuffer() = default;
+        explicit RingBuffer(size_t size) : _mailbox(nullptr), N(size), _head(0), _tail(0), terminate(false){
             CUDA_CHECK(cudaMallocHost(&_mailbox, sizeof(T) * size));
         }
 
@@ -284,11 +303,11 @@ template <typename T> class RingBuffer {
         __device__ __host__
         bool push(const T &data) {
             size_t tail = _tail.load(cuda::memory_order_relaxed);
-            if(tail - _head.load(cuda::memory_order_acquire) == N) {
+            if(tail - _head.load(cuda::memory_order_acquire) % (2 * N) == N) {
                 return false;
             }
 
-            _mailbox[tail % N] = data;
+            _mailbox[_tail % N] = data;
             _tail.store(tail + 1, cuda::memory_order_release);
 
             return true;
@@ -298,11 +317,12 @@ template <typename T> class RingBuffer {
         T pop() {
             T item = RequestItem();
             size_t head = _head.load(cuda::memory_order_relaxed);
-            if(_tail.load(cuda::memory_order_acquire) == head){
+            if((_tail.load(cuda::memory_order_acquire) - head) % (2 * N) == 0){
                 item.image_id = EMPTY_QUEUE;
+                return item;
             }
             else{
-                item = _mailbox[head % N];
+                item = _mailbox[_head % N];
             }
 
             _head.store(head + 1, cuda::memory_order_release);
@@ -322,27 +342,30 @@ void persistent_kernel_image_process(RingBuffer<RequestItem>* cpu_gpu_q, RingBuf
     uchar* cur_tb_maps = maps + bid * TILE_COUNT * TILE_COUNT * COLOR_VALUES;
 
     while(true){
-        if(cpu_gpu_q->terminate || gpu_cpu_q->terminate){
-            return;
-        }
+        // if(cpu_gpu_q->terminate || gpu_cpu_q->terminate){
+        //     return;
+        // }
 
         if(tid == 0){
-            cpu_gpu_lock->lock();
+            gpu_lock->lock();
             request = cpu_gpu_q->pop();
-            cpu_gpu_lock->unlock();
+            gpu_lock->unlock();
         }
         __syncthreads();
 
+        if (request.image_id == TERMINATE)
+        {
+            return; 
+        }
+
         if(request.image_id != EMPTY_QUEUE){
-            __syncthreads();
             process_image(request.image_in, request.image_out, cur_tb_maps);
             __syncthreads();
 
             if(tid == 0){
-                gpu_cpu_lock->lock();
-                while(!gpu_cpu_q->push(request)) {;}
-                gpu_cpu_lock->unlock();
-
+                gpu_lock->lock();
+                while(gpu_cpu_q->push(request) == false) {;}
+                gpu_lock->unlock();
             }
         }
     }
@@ -378,30 +401,9 @@ int calculate_threadblocks_amount(int threads_per_block){
 }
 
 int calculate_queue_size(int threadblocks_amount){
-    return (int)pow(2, ceil(log(16 * threadblocks_amount) / log(2)));
+    return (int)pow(2, ceil(log2(16 * threadblocks_amount) / log2(2)));
 }
 
-__global__ void init_gpu_locks(){
-    uint32_t tid = threadIdx.x;
-    uint32_t bid = blockIdx.x;
-    
-    if(tid == 0 && bid == 0){
-        gpu_cpu_lock = new GPU_Lock();
-        cpu_gpu_lock = new GPU_Lock();
-    }
-}
-
-__global__ void destroy_gpu_locks(){
-    uint32_t tid = threadIdx.x;
-    uint32_t bid = blockIdx.x;
-    
-    if(tid == 0 && bid == 0){
-        delete gpu_cpu_lock;
-        delete cpu_gpu_lock;
-        gpu_cpu_lock = nullptr;
-        cpu_gpu_lock = nullptr;
-    }
-}
 
 class queue_server : public image_processing_server
 {
@@ -428,7 +430,7 @@ public:
         new (gpu_cpu_q) RingBuffer<RequestItem>(q_size);
         // TODO launch GPU persistent kernel with given number of threads, and calculated number of threadblocks
 
-        init_gpu_locks<<<1,1>>>();
+        init_gpu_lock<<<1,1>>>();
         CUDA_CHECK(cudaDeviceSynchronize());
         persistent_kernel_image_process<<<tb_amount, threads>>>(cpu_gpu_q, gpu_cpu_q, maps);
     }
@@ -436,17 +438,22 @@ public:
     ~queue_server() override
     {
         // TODO free resources allocated in constructor
-        cpu_gpu_q->terminate = true;
-        gpu_cpu_q->terminate = true;
+        // cpu_gpu_q->terminate = true;
+        // gpu_cpu_q->terminate = true;
+        uint32_t blocks_count = calculate_threadblocks_amount(1024);
+        for (uint32_t i = 0 ; i < blocks_count * 2 ; i++)
+        {
+            enqueue(TERMINATE, nullptr, nullptr);
+        }
         CUDA_CHECK(cudaDeviceSynchronize());
 
-        cpu_gpu_q->~RingBuffer();
-        gpu_cpu_q->~RingBuffer();
+        cpu_gpu_q->~RingBuffer<RequestItem>();
+        gpu_cpu_q->~RingBuffer<RequestItem>();
         CUDA_CHECK(cudaFreeHost(cpu_gpu_q));
         CUDA_CHECK(cudaFreeHost(gpu_cpu_q));
         CUDA_CHECK(cudaFree(maps));
 
-        destroy_gpu_locks<<<1,1>>>();
+        destroy_gpu_lock<<<1,1>>>();
         CUDA_CHECK(cudaDeviceSynchronize());
     }
 

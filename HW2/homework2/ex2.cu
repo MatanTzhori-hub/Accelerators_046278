@@ -333,6 +333,16 @@ class RingBuffer {
             _head.store(head + 1, cuda::memory_order_release);
             return item;
         }
+
+        
+        __device__ __host__
+        bool is_empty(){
+            size_t head = _head.load(cuda::memory_order_relaxed);
+            if((_tail.load(cuda::memory_order_acquire) - head) % (2 * N) == 0){
+                return true;
+            }
+            return false;
+        }
 };
 
 
@@ -354,7 +364,12 @@ void persistent_kernel_image_process(RingBuffer<RequestItem>* cpu_gpu_q, RingBuf
 
         if(tid == 0){
             gpu_lock->lock();
-            request = cpu_gpu_q->pop();
+            if(!cpu_gpu_q->is_empty()){
+                request = cpu_gpu_q->pop();
+            }
+            else{
+                request.image_id = EMPTY_QUEUE;
+            }
             gpu_lock->unlock();
         }
         __syncthreads();

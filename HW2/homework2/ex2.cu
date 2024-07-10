@@ -280,6 +280,10 @@ struct RequestItem
     int image_id;
     uchar* image_in;
     uchar* image_out;
+
+    RequestItem() = default;
+    RequestItem(const RequestItem&) = default;
+    RequestItem(int id, uchar* in, uchar* out) : image_id(id), image_in(in), image_out(out) {}
 };
 
 template <typename T>
@@ -290,8 +294,10 @@ class RingBuffer {
         cuda::atomic<size_t> _head = 0, _tail = 0;
 
     public:
+        bool terminate;
+
         RingBuffer() = default;
-        explicit RingBuffer(size_t size) : _mailbox(nullptr), N(size), _head(0), _tail(0){
+        explicit RingBuffer(size_t size) : _mailbox(nullptr), N(size), _head(0), _tail(0), terminate(false){
             CUDA_CHECK(cudaMallocHost(&_mailbox, sizeof(T) * size));
         }
 
@@ -327,6 +333,16 @@ class RingBuffer {
             _head.store(head + 1, cuda::memory_order_release);
             return item;
         }
+
+        
+        __device__ __host__
+        bool is_empty(){
+            size_t head = _head.load(cuda::memory_order_relaxed);
+            if((_tail.load(cuda::memory_order_acquire) - head) % (2 * N) == 0){
+                return true;
+            }
+            return false;
+        }
 };
 
 
@@ -338,34 +354,37 @@ void persistent_kernel_image_process(RingBuffer<RequestItem>* cpu_gpu_q, RingBuf
     uint32_t tid = threadIdx.x;
     uint32_t bid = blockIdx.x;
 
-    uchar* cur_tb_maps = maps + bid * TILE_COUNT * TILE_COUNT * COLOR_VALUES;
+    int map_offset = bid * TILE_COUNT * TILE_COUNT * COLOR_VALUES;
+    uchar* cur_tb_maps = maps + map_offset;
 
     while(true){
-        // if(cpu_gpu_q->terminate || gpu_cpu_q->terminate){
-        //     return;
-        // }
+        if(cpu_gpu_q->terminate || gpu_cpu_q->terminate){
+            return;
+        }
 
         if(tid == 0){
             gpu_lock->lock();
-            request = cpu_gpu_q->pop();
+            if(!cpu_gpu_q->is_empty()){
+                request = cpu_gpu_q->pop();
+            }
+            else{
+                request.image_id = EMPTY_QUEUE;
+            }
             gpu_lock->unlock();
         }
         __syncthreads();
 
-        if (request.image_id == TERMINATE)
-        {
-            return; 
+        if(request.image_id == EMPTY_QUEUE){
+            continue;
         }
 
-        if(request.image_id != EMPTY_QUEUE){
-            process_image(request.image_in, request.image_out, cur_tb_maps);
-            __syncthreads();
+        process_image(request.image_in, request.image_out, cur_tb_maps);
+        __syncthreads();
 
-            if(tid == 0){
-                gpu_lock->lock();
-                while(gpu_cpu_q->push(request) == false) {;}
-                gpu_lock->unlock();
-            }
+        if(tid == 0){
+            gpu_lock->lock();
+            while(!gpu_cpu_q->push(request)) {;}
+            gpu_lock->unlock();
         }
     }
 }
@@ -380,7 +399,7 @@ int calculate_threadblocks_amount(int threads_per_block){
     int share_mem_usage_per_tb = SHARED_MEM_USAGE;
     int regs_per_thread = REGISTERS_PER_THREAD;
 
-    size_t shared_mem_per_SM = GPU_Properties.sharedMemPerMultiprocessor;
+    int shared_mem_per_SM = GPU_Properties.sharedMemPerMultiprocessor;
     int max_threads_per_SM = GPU_Properties.maxThreadsPerMultiProcessor;
     int regs_per_SM = GPU_Properties.regsPerMultiprocessor;
 
@@ -393,7 +412,10 @@ int calculate_threadblocks_amount(int threads_per_block){
     int tb_smem_constrain = shared_mem_per_SM / share_mem_usage_per_tb;
     int tb_threads_constrain = max_threads_per_SM / threads_per_block;
 
-    int max_tb_per_sm = min(1, min(tb_regs_constrain, min(tb_smem_constrain, tb_threads_constrain)));
+    // printf("The constrains are: reg_per_SM %d, mem_per_SM %d, threads_per_SM %d\n", regs_per_SM, shared_mem_per_SM, max_threads_per_SM);
+    // printf("The constrains are: Regs - %d, Memory - %d, Threads - %d\n", tb_regs_constrain, tb_smem_constrain, tb_threads_constrain);
+
+    int max_tb_per_sm = min(tb_regs_constrain, min(tb_smem_constrain, tb_threads_constrain));
 
     // We return the amount of Threadblocks per SM times the amount of SM's for the total amount of TB.
     return max_tb_per_sm * sm_amount;
@@ -419,6 +441,9 @@ public:
         int tb_amount = calculate_threadblocks_amount(threads);
         int q_size = calculate_queue_size(tb_amount);
         
+        // printf("Amount of threadblocks is: %d\n", tb_amount);
+        // printf("Size of queues is: %d\n", q_size);
+        
         // Allocate queues and maps memory
         CUDA_CHECK(cudaMallocHost(&cpu_gpu_q, sizeof(RingBuffer<RequestItem>)));
         CUDA_CHECK(cudaMallocHost(&gpu_cpu_q, sizeof(RingBuffer<RequestItem>)));
@@ -437,13 +462,8 @@ public:
     ~queue_server() override
     {
         // TODO free resources allocated in constructor
-        // cpu_gpu_q->terminate = true;
-        // gpu_cpu_q->terminate = true;
-        uint32_t blocks_count = calculate_threadblocks_amount(1024);
-        for (uint32_t i = 0 ; i < blocks_count * 2 ; i++)
-        {
-            enqueue(TERMINATE, nullptr, nullptr);
-        }
+        cpu_gpu_q->terminate = true;
+        gpu_cpu_q->terminate = true;
         CUDA_CHECK(cudaDeviceSynchronize());
 
         cpu_gpu_q->~RingBuffer<RequestItem>();
@@ -459,11 +479,7 @@ public:
     bool enqueue(int img_id, uchar *img_in, uchar *img_out) override
     {
         // TODO push new task into queue if possible
-        RequestItem item;
-        item.image_id = img_id;
-        item.image_in = img_in;
-        item.image_out = img_out;
-        return cpu_gpu_q->push(item);
+        return cpu_gpu_q->push(RequestItem(img_id, img_in, img_out));
     }
 
     bool dequeue(int *img_id) override

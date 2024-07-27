@@ -133,7 +133,7 @@ __device__ void process_image(uchar *all_in, uchar *all_out, uchar* maps) {
             array_initiate(histogram, COLOR_VALUES, 0);
             __syncthreads();
 
-            calc_tile_histogram(histogram, in, tile_row, tile_col);
+            calc_tile_histogram(histogram, all_in, tile_row, tile_col);
             __syncthreads();
 
             prefix_sum(histogram, COLOR_VALUES);
@@ -144,7 +144,7 @@ __device__ void process_image(uchar *all_in, uchar *all_out, uchar* maps) {
         }
     }
 
-    interpolate_device(maps, in, out);
+    interpolate_device(maps, all_in, all_out);
     __syncthreads();
 
     return; 

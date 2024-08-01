@@ -11,6 +11,8 @@
 
 #include <infiniband/verbs.h>
 
+/****************** RCP Implementation - Start ******************/
+
 class server_rpc_context : public rdma_server_context {
 private:
     std::unique_ptr<queue_server> gpu_context;
@@ -247,24 +249,72 @@ public:
     }
 };
 
+/****************** RCP Implementation - End ******************/
+
+struct remote_information{
+    // Server images buffers
+    uint64_t images_in_addr;
+    uint32_t images_in_rkey;
+    uint64_t images_out_addr;
+    uint32_t images_out_rkey;
+
+    // CPU to GPU
+    uint64_t cpu_gpu_q_addr;
+    uint32_t cpu_gpu_q_rkey; 
+
+    // GPU to CPU
+    uint64_t gpu_cpu_q_addr;
+    uint32_t gpu_cpu_q_rkey; 
+
+    int q_size;
+}
+
+
 class server_queues_context : public rdma_server_context {
 private:
     std::unique_ptr<image_processing_server> server;
 
     /* TODO: add memory region(s) for CPU-GPU queues */
+    struct ibv_mr *cpu_gpu_q_mr;
+    struct ibv_mr *gpu_cpu_q_mr;
 
+    // Remove Information
+    remote_information remote_info;
 public:
-    explicit server_queues_context(uint16_t tcp_port) : rdma_server_context(tcp_port)
+    explicit server_queues_context(uint16_t tcp_port) : rdma_server_context(tcp_port), server(1024)
     {
         /* TODO Initialize additional server MRs as needed. */
+        cpu_gpu_q_mr = ibv_reg_mr(pd, server->cpu_gpu_q, sizeof(RingBuffer), IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_READ);
+        gpu_cpu_q_mr = ibv_reg_mr(pd, server->gpu_cpu_q, sizeof(RingBuffer), IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_READ);
+        
+        if (!cpu_gpu_q_mr || !gpu_cpu_q_mr) 
+        {
+            fprintf(stderr, "Error, ibv_reg_mr() failed\n");
+            exit(1);
+        }
+
+        this->remote_info.images_in_addr = (uint64_t) images_in;
+        this->remote_info.images_in_rkey = (uint64_t) mr_images_in->rkey;
+        this->remote_info.images_out_addr = (uint64_t) images_out;
+        this->remote_info.images_out_rkey = (uint64_t) mr_images_out->rkey;
+
+        this->remote_info.cpu_gpu_q_addr = (uint64_t) &server->cpu_gpu_q;
+        this->remote_info.cpu_gpu_q_rkey = cpu_gpu_q_mr->rkey;
+        this->remote_info.gpu_cpu_q_addr = (uint64_t) &server->gpu_cpu_q;
+        this->remote_info.gpu_cpu_q_rkey = gpu_cpu_q_mr->rkey;
+
+        this->remote_info.q_size = server->q_size;
 
         /* TODO Exchange rkeys, addresses, and necessary information (e.g.
          * number of queues) with the client */
+        send_over_socket(&remote_info, sizeof(remote_info));
     }
 
     ~server_queues_context()
     {
         /* TODO destroy the additional server MRs here */
+        ibv_dereg_mr(cpu_gpu_q_mr);
+        ibv_dereg_mr(gpu_cpu_q_mr);
     }
 
     virtual void event_loop() override
@@ -272,6 +322,43 @@ public:
         /* TODO simplified version of server_rpc_context::event_loop. As the
          * client use one sided operations, we only need one kind of message to
          * terminate the server at the end. */
+        rpc_request* req;
+
+        bool terminate = false;
+
+        while (!terminate) {
+            // Step 1: Poll for CQE
+            struct ibv_wc wc;
+            int ncqes = ibv_poll_cq(cq, 1, &wc);
+            if (ncqes < 0) {
+                perror("ibv_poll_cq() failed");
+                exit(1);
+            }
+            if (ncqes > 0) {
+		        VERBS_WC_CHECK(wc);
+
+                switch (wc.opcode) {
+                case IBV_WC_RECV:
+                    /* Received a new request from the client */
+                    req = &requests[wc.wr_id];
+
+                    /* Terminate signal */
+                    if (req->request_id == TERMINATE) {
+                        printf("Terminating...\n");
+                        terminate = true;
+
+                        post_rdma_write(
+                                req->output_addr,                       // remote_dst
+                                0,                                      // len
+                                req->output_rkey,                       // rkey
+                                0,                                      // local_src
+                                mr_images_out->lkey,                    // lkey
+                                (uint64_t)TERMINATE,                    // wr_id
+                                (uint32_t *)&req->request_id);          // immediate
+                    }
+                    break;
+            }
+        }
     }
 };
 

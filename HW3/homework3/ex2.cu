@@ -226,12 +226,12 @@ struct RequestItem
 
 template <typename T>
 class RingBuffer {
-    private:
+    public:
+
         T* _mailbox;
         size_t N;
         cuda::atomic<size_t> _head = 0, _tail = 0;
 
-    public:
         bool terminate;
 
         RingBuffer() = default;
@@ -279,6 +279,16 @@ class RingBuffer {
             if((_tail.load(cuda::memory_order_acquire) - head) % (2 * N) == 0){
                 return true;
             }
+            return false;
+        }
+
+        __device__ __host__
+        bool is_full(){
+            size_t tail = _tail.load(cuda::memory_order_relaxed);
+            if((tail - _head.load(cuda::memory_order_acquire)) % (2 * N) == N) {
+                return true;
+            }
+
             return false;
         }
 };
@@ -368,11 +378,12 @@ int calculate_queue_size(int threadblocks_amount){
 
 class queue_server : public image_processing_server
 {
-private:
+public:
     RingBuffer<RequestItem>* cpu_gpu_q;
     RingBuffer<RequestItem>* gpu_cpu_q;
     uchar* maps;
-public:
+    int q_size;
+
     //TODO complete according to HW2
     //(This file should be almost identical to ex2.cu from homework 2.)
 
@@ -381,7 +392,7 @@ public:
         //TODO complete according to HW2
         //(This file should be almost identical to ex2.cu from homework 2.)
         int tb_amount = calculate_threadblocks_amount(threads);
-        int q_size = calculate_queue_size(tb_amount);
+        this->q_size = calculate_queue_size(tb_amount);
         
         // printf("Amount of threadblocks is: %d\n", tb_amount);
         // printf("Size of queues is: %d\n", q_size);
@@ -392,8 +403,8 @@ public:
         CUDA_CHECK(cudaMalloc(&maps, tb_amount * TILE_COUNT * TILE_COUNT * COLOR_VALUES));
 
         // Initialize the queues
-        new (cpu_gpu_q) RingBuffer<RequestItem>(q_size);
-        new (gpu_cpu_q) RingBuffer<RequestItem>(q_size);
+        new (cpu_gpu_q) RingBuffer<RequestItem>(this->q_size);
+        new (gpu_cpu_q) RingBuffer<RequestItem>(this->q_size);
 
         // Launch GPU persistent kernel with given number of threads, and calculated number of threadblocks
         init_gpu_lock<<<1,1>>>();

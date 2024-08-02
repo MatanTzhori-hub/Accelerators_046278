@@ -361,7 +361,7 @@ public:
 
                     /* Terminate signal */
                     if (req->request_id == TERMINATE) {
-                        printf("Terminating...\n");
+                        // printf("Terminating...\n");
                         terminate = true;
 
                         post_rdma_write(
@@ -467,14 +467,15 @@ public:
         uint64_t tail_adjust = offsetof(RingBuffer<RequestItem>, _tail);
 
         /* Enqueu flow:
-        *  1. Check if cpu->gpu queue is empty with rdma read request on remote queue
+        *  1. Check if cpu->gpu queue is empty by using rdma read on the server's cpu->gpu's head and tail.
         *  2. If empty return false.
-        *  3. Else, copy image to remote
-        *  4. Update local cpu->gpu by pushing request
-        *  5. Write updated queue to remote
+        *  3. Else, copy image to remote with rdma write
+        *  4. Update local_request with the image request info for the server.
+        *  5. Write the local_request to it's place in the cpu->gpu on the server.
+        *  6. Update the tail indicating we pushed a request and write the updated tail to the server's cpu->gpu's tail.
         */
 
-        // Read remote queue and check if full
+        // Read remote queue's tail
         post_rdma_read(&local_buffer.cpu_gpu_tail,                           // local_dst
                        sizeof(cuda::atomic<size_t>),     // len
                        local_buffer_mr->lkey,                  // lkey
@@ -489,6 +490,7 @@ public:
         }
         VERBS_WC_CHECK(wc);
 
+        // Read remote queue's head
         post_rdma_read(&local_buffer.cpu_gpu_head,                           // local_dst
                        sizeof(cuda::atomic<size_t>),     // len
                        local_buffer_mr->lkey,                  // lkey
@@ -503,6 +505,7 @@ public:
         }
         VERBS_WC_CHECK(wc);
         
+        // Check if queue is empty, if so return false
         if (local_buffer.cpu_gpu_tail.load() - local_buffer.cpu_gpu_head.load() == (size_t)remote_info.q_size) {
             return false;
         }
@@ -522,11 +525,12 @@ public:
         }
         VERBS_WC_CHECK(wc);
 
-        // Update cpu-gpu queue and write to remote
+        // Update local_request with request's info on the server
         local_buffer.request = RequestItem(img_id,
                                     (uchar*)(remote_info.images_in_addr + image_adjust),
                                     (uchar*)(remote_info.images_out_addr + image_adjust));
 
+        // Write the local_request to the server in its appropriate place
         post_rdma_write((uint64_t)(remote_info.cpu_gpu_q_mbx_addr + sizeof(RequestItem)*(local_buffer.cpu_gpu_tail % remote_info.q_size)),     // remote_dst
                     sizeof(RequestItem),    // len
                     remote_info.cpu_gpu_q_mbx_rkey,         // rkey
@@ -540,6 +544,7 @@ public:
         }
         VERBS_WC_CHECK(wc);
 
+        // Update the tail of the queue on the server
         local_buffer.cpu_gpu_tail++;
         post_rdma_write(remote_info.cpu_gpu_q_addr + tail_adjust,     // remote_dst
                     sizeof(cuda::atomic<size_t>),    // len
@@ -569,14 +574,14 @@ public:
         uint64_t tail_adjust = offsetof(RingBuffer<RequestItem>, _tail);
 
         /* Enqueu flow:
-        *  1. Check if cpu->gpu queue is empty with rdma read request on remote queue
-        *  2. If empty return false.
-        *  3. Update local cpu->gpu by popping
-        *  4. Write updated queue to remote
-        *  5. Read the image from remote
+        *  1. Check if gpu->cpu queue is full by using rdma read on the server's gpu->cpu's head and tail.
+        *  2. If full return false.
+        *  3. Else, read the request from the gpu->cpu queue
+        *  4. Read the output image from the server with rdma read.
+        *  6. Update the head indicating we pooped a request and write the updated head to the server's gpu->cpu's head.
         */
 
-        // Read remote queue and check if full
+        // Read remote queue's head
         post_rdma_read(&local_buffer.gpu_cpu_head,                           // local_dst
                        sizeof(cuda::atomic<size_t>),     // len
                        local_buffer_mr->lkey,                  // lkey
@@ -591,6 +596,7 @@ public:
         }
         VERBS_WC_CHECK(wc);
 
+        // Read remote queue's tail
         post_rdma_read(&local_buffer.gpu_cpu_tail,                           // local_dst
                        sizeof(cuda::atomic<size_t>),     // len
                        local_buffer_mr->lkey,                  // lkey
@@ -605,6 +611,7 @@ public:
         }
         VERBS_WC_CHECK(wc);
 
+        // Check if queue is full, if so return false
         if (local_buffer.gpu_cpu_tail == local_buffer.gpu_cpu_head) {
             return false;
         }
@@ -642,6 +649,7 @@ public:
         }
         VERBS_WC_CHECK(wc);
 
+        // Update the head of the queue on the server
         local_buffer.gpu_cpu_head++;
         post_rdma_write(remote_info.gpu_cpu_q_addr + head_adjust,     // remote_dst
                     sizeof(cuda::atomic<size_t>),    // len
@@ -712,7 +720,7 @@ public:
 
                 /* Terminate signal */
                 if (req->request_id == TERMINATE) {
-                    printf("Terminating...\n");
+                    // printf("Terminating...\n");
                     terminated = true;
                 }
             }

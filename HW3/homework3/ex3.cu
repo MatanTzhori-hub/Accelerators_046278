@@ -475,20 +475,6 @@ public:
         */
 
         // Read remote queue and check if full
-        post_rdma_read(&local_buffer.cpu_gpu_head,                           // local_dst
-                       sizeof(cuda::atomic<size_t>),     // len
-                       local_buffer_mr->lkey,                  // lkey
-                       remote_info.cpu_gpu_q_addr + head_adjust,          // remote_src
-                       remote_info.cpu_gpu_q_rkey,          // rkey
-                       0);                                  // wr_id
-
-        while ((ncqes = ibv_poll_cq(cq, 1, &wc)) == 0) {}
-        if (ncqes < 0) {
-                perror("ibv_poll_cq() failed");
-                exit(1);
-        }
-        VERBS_WC_CHECK(wc);
-
         post_rdma_read(&local_buffer.cpu_gpu_tail,                           // local_dst
                        sizeof(cuda::atomic<size_t>),     // len
                        local_buffer_mr->lkey,                  // lkey
@@ -503,6 +489,20 @@ public:
         }
         VERBS_WC_CHECK(wc);
 
+        post_rdma_read(&local_buffer.cpu_gpu_head,                           // local_dst
+                       sizeof(cuda::atomic<size_t>),     // len
+                       local_buffer_mr->lkey,                  // lkey
+                       remote_info.cpu_gpu_q_addr + head_adjust,          // remote_src
+                       remote_info.cpu_gpu_q_rkey,          // rkey
+                       0);                                  // wr_id
+
+        while ((ncqes = ibv_poll_cq(cq, 1, &wc)) == 0) {}
+        if (ncqes < 0) {
+                perror("ibv_poll_cq() failed");
+                exit(1);
+        }
+        VERBS_WC_CHECK(wc);
+        
         if (local_buffer.cpu_gpu_tail.load() - local_buffer.cpu_gpu_head.load() == (size_t)remote_info.q_size) {
             return false;
         }
@@ -605,7 +605,7 @@ public:
         }
         VERBS_WC_CHECK(wc);
 
-        if (local_buffer.gpu_cpu_tail.load() - local_buffer.gpu_cpu_head.load() == 0) {
+        if (local_buffer.gpu_cpu_tail == local_buffer.gpu_cpu_head) {
             return false;
         }
 
@@ -628,7 +628,7 @@ public:
         *img_id = local_buffer.request.image_id;
 
         // Read image from remote
-        post_rdma_read((char*)mr_images_out->addr + *img_id % OUTSTANDING_REQUESTS * IMG_SZ,      // local_dst
+        post_rdma_read((char*)mr_images_out->addr + ((*img_id) % N_IMAGES) * IMG_SZ,      // local_dst
                        IMG_SZ,                                                  // len
                        mr_images_out->lkey,                                     // lkey
                        remote_info.images_out_addr + *img_id % OUTSTANDING_REQUESTS * IMG_SZ,     // remote_src
@@ -646,7 +646,7 @@ public:
         post_rdma_write(remote_info.gpu_cpu_q_addr + head_adjust,     // remote_dst
                     sizeof(cuda::atomic<size_t>),    // len
                     remote_info.gpu_cpu_q_rkey,         // rkey
-                    &local_buffer.gpu_cpu_tail,                          // local_src
+                    &local_buffer.gpu_cpu_head,                          // local_src
                     local_buffer_mr->lkey,                 // lkey
                     *img_id);
         while (( ncqes = ibv_poll_cq(cq, 1, &wc)) == 0) {}

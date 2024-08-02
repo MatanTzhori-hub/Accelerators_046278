@@ -11,6 +11,8 @@
 
 #include <infiniband/verbs.h>
 
+#include <stddef.h>  // for offsetof
+
 /****************** RCP Implementation - Start ******************/
 
 class server_rpc_context : public rdma_server_context {
@@ -263,10 +265,14 @@ struct remote_information{
     // CPU to GPU
     uint64_t cpu_gpu_q_addr;
     uint32_t cpu_gpu_q_rkey; 
+    uint64_t cpu_gpu_q_mbx_addr;
+    uint32_t cpu_gpu_q_mbx_rkey; 
 
     // GPU to CPU
     uint64_t gpu_cpu_q_addr;
     uint32_t gpu_cpu_q_rkey; 
+    uint64_t gpu_cpu_q_mbx_addr;
+    uint32_t gpu_cpu_q_mbx_rkey; 
 
     int q_size;
 };
@@ -278,7 +284,9 @@ private:
 
     /* TODO: add memory region(s) for CPU-GPU queues */
     struct ibv_mr *cpu_gpu_q_mr;
+    struct ibv_mr *cpu_gpu_q_mbx_mr;
     struct ibv_mr *gpu_cpu_q_mr;
+    struct ibv_mr *gpu_cpu_q_mbx_mr;
 
     // Remote Information
     remote_information remote_info;
@@ -287,23 +295,33 @@ public:
     {
         /* TODO Initialize additional server MRs as needed. */
         cpu_gpu_q_mr = ibv_reg_mr(pd, server->cpu_gpu_q, sizeof(RingBuffer<RequestItem>), IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_READ);
+        cpu_gpu_q_mbx_mr = ibv_reg_mr(pd, server->cpu_gpu_q->_mailbox, sizeof(RequestItem)*server->cpu_gpu_q->N, IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_READ);
         gpu_cpu_q_mr = ibv_reg_mr(pd, server->gpu_cpu_q, sizeof(RingBuffer<RequestItem>), IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_READ);
-        
+        gpu_cpu_q_mbx_mr = ibv_reg_mr(pd, server->gpu_cpu_q->_mailbox, sizeof(RequestItem)*server->gpu_cpu_q->N, IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_READ);
+
+
         if (!cpu_gpu_q_mr || !gpu_cpu_q_mr) 
         {
             fprintf(stderr, "Error, ibv_reg_mr() failed\n");
             exit(1);
         }
 
-        this->remote_info.images_in_addr = (uint64_t) images_in;
+        this->remote_info.images_in_addr = (uint64_t) mr_images_in->addr;
         this->remote_info.images_in_rkey = mr_images_in->rkey;
-        this->remote_info.images_out_addr = (uint64_t) images_out;
+        this->remote_info.images_out_addr = (uint64_t) mr_images_out->addr;
         this->remote_info.images_out_rkey = mr_images_out->rkey;
 
         this->remote_info.cpu_gpu_q_addr = (uint64_t) cpu_gpu_q_mr->addr;
         this->remote_info.cpu_gpu_q_rkey = cpu_gpu_q_mr->rkey;
+        this->remote_info.cpu_gpu_q_mbx_addr = (uint64_t) cpu_gpu_q_mbx_mr->addr;
+        this->remote_info.cpu_gpu_q_mbx_rkey = cpu_gpu_q_mbx_mr->rkey;
+        
         this->remote_info.gpu_cpu_q_addr = (uint64_t) gpu_cpu_q_mr->addr;
         this->remote_info.gpu_cpu_q_rkey = gpu_cpu_q_mr->rkey;
+        this->remote_info.gpu_cpu_q_mbx_addr = (uint64_t) gpu_cpu_q_mbx_mr->addr;
+        this->remote_info.gpu_cpu_q_mbx_rkey = gpu_cpu_q_mbx_mr->rkey;
+
+        this->remote_info.q_size = server->cpu_gpu_q->N;
 
         /* TODO Exchange rkeys, addresses, and necessary information (e.g.
          * number of queues) with the client */
@@ -361,14 +379,22 @@ public:
     }
 };
 
+struct local_buffers{
+    cuda::atomic<size_t> cpu_gpu_head;
+    cuda::atomic<size_t> cpu_gpu_tail;
+
+    cuda::atomic<size_t> gpu_cpu_head;
+    cuda::atomic<size_t> gpu_cpu_tail;
+    
+    RequestItem request;
+};
+
 class client_queues_context : public rdma_client_context {
 private:
     /* TODO add necessary context to track the client side of the GPU's
      * producer/consumer queues */
-    RingBuffer<RequestItem>* cpu_gpu_q;
-    RingBuffer<RequestItem>* gpu_cpu_q;
-    struct ibv_mr *cpu_gpu_q_mr;
-    struct ibv_mr *gpu_cpu_q_mr;
+    struct local_buffers local_buffer;
+    struct ibv_mr *local_buffer_mr;
 
     // Remote Information
     remote_information remote_info;
@@ -385,15 +411,10 @@ public:
          * the GPU queues remotely. */
         recv_over_socket(&remote_info, sizeof(remote_info));
 
-        cpu_gpu_q = new RingBuffer<RequestItem>();
-        gpu_cpu_q = new RingBuffer<RequestItem>();
-
-        cpu_gpu_q_mr = ibv_reg_mr(pd, cpu_gpu_q, sizeof(RingBuffer<RequestItem>), IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_READ);
-        gpu_cpu_q_mr = ibv_reg_mr(pd, gpu_cpu_q, sizeof(RingBuffer<RequestItem>), IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE  | IBV_ACCESS_REMOTE_READ);
+        local_buffer_mr = ibv_reg_mr(pd, &local_buffer, sizeof(local_buffers), IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_READ);
         
-        if (!cpu_gpu_q_mr || !gpu_cpu_q_mr) 
+        if (!local_buffer_mr) 
         {
-            printf("Here? - 1");
             fprintf(stderr, "Error, ibv_reg_mr() failed\n");
             exit(1);
         }
@@ -406,8 +427,7 @@ public:
         send_termination();
         while (!get_termination()){};
 
-        ibv_dereg_mr(cpu_gpu_q_mr);
-        ibv_dereg_mr(gpu_cpu_q_mr);
+        ibv_dereg_mr(local_buffer_mr);
     }
 
     virtual void set_input_images(uchar *images_in, size_t bytes) override
@@ -438,11 +458,13 @@ public:
     {
         /* TODO use RDMA Write and RDMA Read operations to enqueue the task on
          * a CPU-GPU producer consumer queue running on the server. */
-        
+
         struct ibv_wc wc; 
         int ncqes;
         
-        int image_adjust = img_id * IMG_SZ;
+        int image_adjust = img_id % OUTSTANDING_REQUESTS * IMG_SZ;
+        uint64_t head_adjust = offsetof(RingBuffer<RequestItem>, _head);
+        uint64_t tail_adjust = offsetof(RingBuffer<RequestItem>, _tail);
 
         /* Enqueu flow:
         *  1. Check if cpu->gpu queue is empty with rdma read request on remote queue
@@ -453,10 +475,10 @@ public:
         */
 
         // Read remote queue and check if full
-        post_rdma_read(cpu_gpu_q,                           // local_dst
-                       sizeof(RingBuffer<RequestItem>),     // len
-                       cpu_gpu_q_mr->lkey,                  // lkey
-                       remote_info.cpu_gpu_q_addr,          // remote_src
+        post_rdma_read(&local_buffer.cpu_gpu_head,                           // local_dst
+                       sizeof(cuda::atomic<size_t>),     // len
+                       local_buffer_mr->lkey,                  // lkey
+                       remote_info.cpu_gpu_q_addr + head_adjust,          // remote_src
                        remote_info.cpu_gpu_q_rkey,          // rkey
                        0);                                  // wr_id
 
@@ -467,7 +489,21 @@ public:
         }
         VERBS_WC_CHECK(wc);
 
-        if (cpu_gpu_q->_tail - cpu_gpu_q->_head == cpu_gpu_q->N) {
+        post_rdma_read(&local_buffer.cpu_gpu_tail,                           // local_dst
+                       sizeof(cuda::atomic<size_t>),     // len
+                       local_buffer_mr->lkey,                  // lkey
+                       remote_info.cpu_gpu_q_addr + tail_adjust,          // remote_src
+                       remote_info.cpu_gpu_q_rkey,          // rkey
+                       0);                                  // wr_id
+
+        while ((ncqes = ibv_poll_cq(cq, 1, &wc)) == 0) {}
+        if (ncqes < 0) {
+                perror("ibv_poll_cq() failed");
+                exit(1);
+        }
+        VERBS_WC_CHECK(wc);
+
+        if (local_buffer.cpu_gpu_tail.load() - local_buffer.cpu_gpu_head.load() == (size_t)remote_info.q_size) {
             return false;
         }
 
@@ -486,18 +522,30 @@ public:
         }
         VERBS_WC_CHECK(wc);
 
-        printf("Im here\n");
-        printf("head: %lu, tail: %lu\n", cpu_gpu_q->_head.load(), cpu_gpu_q->_tail.load());
-
         // Update cpu-gpu queue and write to remote
-        RequestItem req(img_id, (uchar*)(remote_info.images_in_addr + image_adjust), (uchar*)(remote_info.images_out_addr + image_adjust));
-        cpu_gpu_q->push(req);
+        local_buffer.request = RequestItem(img_id,
+                                    (uchar*)(remote_info.images_in_addr + image_adjust),
+                                    (uchar*)(remote_info.images_out_addr + image_adjust));
 
-        post_rdma_write(remote_info.cpu_gpu_q_addr,     // remote_dst
-                    sizeof(RingBuffer<RequestItem>),    // len
+        post_rdma_write((uint64_t)(remote_info.cpu_gpu_q_mbx_addr + sizeof(RequestItem)*(local_buffer.cpu_gpu_tail % remote_info.q_size)),     // remote_dst
+                    sizeof(RequestItem),    // len
+                    remote_info.cpu_gpu_q_mbx_rkey,         // rkey
+                    &local_buffer.request,                          // local_src
+                    local_buffer_mr->lkey,                 // lkey
+                    img_id);
+        while (( ncqes = ibv_poll_cq(cq, 1, &wc)) == 0) {}
+        if (ncqes < 0) {
+                perror("ibv_poll_cq() failed");
+                exit(1);
+        }
+        VERBS_WC_CHECK(wc);
+
+        local_buffer.cpu_gpu_tail++;
+        post_rdma_write(remote_info.cpu_gpu_q_addr + tail_adjust,     // remote_dst
+                    sizeof(cuda::atomic<size_t>),    // len
                     remote_info.cpu_gpu_q_rkey,         // rkey
-                    cpu_gpu_q,                          // local_src
-                    cpu_gpu_q_mr->lkey,                 // lkey
+                    &local_buffer.cpu_gpu_tail,                          // local_src
+                    local_buffer_mr->lkey,                 // lkey
                     img_id);
         while (( ncqes = ibv_poll_cq(cq, 1, &wc)) == 0) {}
         if (ncqes < 0) {
@@ -516,6 +564,9 @@ public:
 
         struct ibv_wc wc; 
         int ncqes;
+        
+        uint64_t head_adjust = offsetof(RingBuffer<RequestItem>, _head);
+        uint64_t tail_adjust = offsetof(RingBuffer<RequestItem>, _tail);
 
         /* Enqueu flow:
         *  1. Check if cpu->gpu queue is empty with rdma read request on remote queue
@@ -526,12 +577,12 @@ public:
         */
 
         // Read remote queue and check if full
-        post_rdma_read(gpu_cpu_q,                               // local_dst
-                       sizeof(RingBuffer<RequestItem>),         // len
-                       gpu_cpu_q_mr->lkey,                      // lkey
-                       remote_info.gpu_cpu_q_addr,              // remote_src
-                       remote_info.gpu_cpu_q_rkey,              // rkey
-                       11);                                      // wr_id
+        post_rdma_read(&local_buffer.gpu_cpu_head,                           // local_dst
+                       sizeof(cuda::atomic<size_t>),     // len
+                       local_buffer_mr->lkey,                  // lkey
+                       remote_info.gpu_cpu_q_addr + head_adjust,          // remote_src
+                       remote_info.gpu_cpu_q_rkey,          // rkey
+                       0);                                  // wr_id
 
         while ((ncqes = ibv_poll_cq(cq, 1, &wc)) == 0) {}
         if (ncqes < 0) {
@@ -540,19 +591,50 @@ public:
         }
         VERBS_WC_CHECK(wc);
 
-        if (gpu_cpu_q->_tail - gpu_cpu_q->_head == 0) {
+        post_rdma_read(&local_buffer.gpu_cpu_tail,                           // local_dst
+                       sizeof(cuda::atomic<size_t>),     // len
+                       local_buffer_mr->lkey,                  // lkey
+                       remote_info.gpu_cpu_q_addr + tail_adjust,          // remote_src
+                       remote_info.gpu_cpu_q_rkey,          // rkey
+                       0);                                  // wr_id
+
+        while ((ncqes = ibv_poll_cq(cq, 1, &wc)) == 0) {}
+        if (ncqes < 0) {
+                perror("ibv_poll_cq() failed");
+                exit(1);
+        }
+        VERBS_WC_CHECK(wc);
+
+        if (local_buffer.gpu_cpu_tail.load() - local_buffer.gpu_cpu_head.load() == 0) {
             return false;
         }
 
-        // Update gpu->cpu queue and write to remote
-        RequestItem req = gpu_cpu_q->pop();
 
-        post_rdma_write(remote_info.gpu_cpu_q_addr,           // remote_dst
-                    sizeof(RingBuffer<RequestItem>),          // len
-                    remote_info.gpu_cpu_q_rkey,               // rkey
-                    gpu_cpu_q,                                // local_src
-                    gpu_cpu_q_mr->lkey,                       // lkey
-                    req.image_id);
+        // Read the request
+        post_rdma_read(&local_buffer.request,     // local_dst
+                       sizeof(RequestItem),     // len
+                       local_buffer_mr->lkey,                  // lkey
+                       remote_info.gpu_cpu_q_mbx_addr + sizeof(RequestItem)*(local_buffer.gpu_cpu_head % remote_info.q_size),          // remote_src
+                       remote_info.gpu_cpu_q_mbx_rkey,          // rkey
+                       0);                                  // wr_id
+
+        while ((ncqes = ibv_poll_cq(cq, 1, &wc)) == 0) {}
+        if (ncqes < 0) {
+                perror("ibv_poll_cq() failed");
+                exit(1);
+        }
+        VERBS_WC_CHECK(wc);
+
+        *img_id = local_buffer.request.image_id;
+
+        // Read image from remote
+        post_rdma_read((char*)mr_images_out->addr + *img_id % OUTSTANDING_REQUESTS * IMG_SZ,      // local_dst
+                       IMG_SZ,                                                  // len
+                       mr_images_out->lkey,                                     // lkey
+                       remote_info.images_out_addr + *img_id % OUTSTANDING_REQUESTS * IMG_SZ,     // remote_src
+                       remote_info.images_out_rkey,                             // rkey
+                       *img_id);                                           // wr_id
+
         while (( ncqes = ibv_poll_cq(cq, 1, &wc)) == 0) {}
         if (ncqes < 0) {
                 perror("ibv_poll_cq() failed");
@@ -560,14 +642,13 @@ public:
         }
         VERBS_WC_CHECK(wc);
 
-        // Read image from remote
-        post_rdma_read((char*)mr_images_out->addr + req.image_id * IMG_SZ,      // local_dst
-                       IMG_SZ,                                                  // len
-                       mr_images_out->lkey,                                     // lkey
-                       remote_info.images_out_addr + req.image_id * IMG_SZ,     // remote_src
-                       remote_info.images_out_rkey,                             // rkey
-                       req.image_id);                                           // wr_id
-
+        local_buffer.gpu_cpu_head++;
+        post_rdma_write(remote_info.gpu_cpu_q_addr + head_adjust,     // remote_dst
+                    sizeof(cuda::atomic<size_t>),    // len
+                    remote_info.gpu_cpu_q_rkey,         // rkey
+                    &local_buffer.gpu_cpu_tail,                          // local_src
+                    local_buffer_mr->lkey,                 // lkey
+                    *img_id);
         while (( ncqes = ibv_poll_cq(cq, 1, &wc)) == 0) {}
         if (ncqes < 0) {
                 perror("ibv_poll_cq() failed");
@@ -577,6 +658,7 @@ public:
 
         return true;
     }
+
 
     
 
